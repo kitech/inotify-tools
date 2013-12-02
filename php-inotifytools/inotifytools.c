@@ -20,7 +20,7 @@
 
 /* #include <sys/inotify.h> */
 /* {{{ inotifytools_functions[] */
-function_entry inotifytools_functions[] = {
+zend_function_entry inotifytools_functions[] = {
 	PHP_FE(inotifytools_initialize, inotifytools_initialize_arg_info)
 	PHP_FE(inotifytools_error  , inotifytools_error_arg_info)
 	PHP_FE(inotifytools_event_to_str, inotifytools_event_to_str_arg_info)
@@ -189,7 +189,7 @@ PHP_FUNCTION(inotifytools_event_to_str)
 }
 /* }}} inotifytools_event_to_str */
 
-
+long g_watch_event = 0;
 /* {{{ proto int inotifytools_watch_recursively(string path, int event)
    */
 PHP_FUNCTION(inotifytools_watch_recursively)
@@ -205,12 +205,27 @@ PHP_FUNCTION(inotifytools_watch_recursively)
 		return;
 	}
 
+    g_watch_event = event;
+
 	do {
 		RETURN_LONG(inotifytools_watch_recursively(path, event));
 	} while (0);
 }
 /* }}} inotifytools_watch_recursively */
 
+static int isdir( char const * path ) {
+	static struct stat64 my_stat;
+
+	if ( -1 == lstat64( path, &my_stat ) ) {
+		if (errno == ENOENT) return 0;
+		fprintf(stderr, "Stat failed on %s: %s\n", path, strerror(errno));
+		return 0;
+	}
+
+	return S_ISDIR( my_stat.st_mode ) && !S_ISLNK( my_stat.st_mode );
+}
+
+#define nasprintf(...) asprintf(__VA_ARGS__)
 
 /* {{{ proto mixed inotifytools_next_event(int timeout)
    */
@@ -218,7 +233,7 @@ PHP_FUNCTION(inotifytools_next_event)
 {
 
 	long timeout = 0;
-
+    char buff[256] = {0};
 
 
 	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "l", &timeout) == FAILURE) {
@@ -226,15 +241,61 @@ PHP_FUNCTION(inotifytools_next_event)
 	}
 
 	do {
-		struct inotify_event *ev;
-		ev = inotifytools_next_event(timeout);
+        char * moved_from = 0;
+		struct inotify_event *ev, *event;
+		event = ev = inotifytools_next_events(timeout, 1);
 		if (!ev) RETURN_NULL();
+
+		if ((event->mask & IN_CREATE) ||
+			(!moved_from && (event->mask & IN_MOVED_TO))) {
+			// New file - if it is a directory, watch it
+			static char * new_file;
+
+			nasprintf( &new_file, "%s%s",
+					   inotifytools_filename_from_wd( event->wd ),
+					   event->name );
+
+			if ( isdir(new_file) &&
+				 !inotifytools_watch_recursively( new_file, g_watch_event ) ) {
+				/*output_error( syslog, "Couldn't watch new directory %s: %s\n",
+				  new_file, strerror( inotifytools_error() ) );*/
+				printf("Couldn't watch new dir %s: %s\n", new_file, "aa");
+			}
+			free( new_file );
+		} // IN_CREATE
+		else if (event->mask & IN_MOVED_FROM) {
+			nasprintf( &moved_from, "%s%s/",
+					   inotifytools_filename_from_wd( event->wd ),
+					   event->name );
+			// if not watched...
+			if ( inotifytools_wd_from_filename(moved_from) == -1 ) {
+				free( moved_from );
+				moved_from = 0;
+			}
+		} // IN_MOVED_FROM
+		else if (event->mask & IN_MOVED_TO) {
+			if ( moved_from ) {
+				static char * new_name;
+				nasprintf( &new_name, "%s%s/",
+						   inotifytools_filename_from_wd( event->wd ),
+						   event->name );
+				inotifytools_replace_filename( moved_from, new_name );
+				free( moved_from );
+				moved_from = 0;
+			} // moved_from
+		}
+
 		array_init(return_value);
 		add_assoc_long(return_value, "wd", ev->wd);
 		add_assoc_long(return_value, "mask", ev->mask);
 		add_assoc_long(return_value, "cookie", ev->cookie);
 		add_assoc_stringl(return_value, "name", ev->name, ev->len, 1);
 		add_assoc_long(return_value, "wd", ev->wd);
+		sprintf(buff, "%s", inotifytools_filename_from_wd(ev->wd));
+        add_assoc_stringl(return_value, "dir", buff, strlen(buff), 1);
+
+
+
 	} while (0);
 }
 /* }}} inotifytools_next_event */
